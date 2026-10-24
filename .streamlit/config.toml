@@ -1,0 +1,6 @@
+[server]
+maxUploadSize = 100          # PDF 업로드 한도(MB)
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false

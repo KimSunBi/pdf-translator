@@ -1,0 +1,12 @@
+# 비밀 값: 절대 저장소에 올리지 않는다
+.streamlit/secrets.toml
+.env
+*.key
+
+# 결과물·캐시
+output/
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/

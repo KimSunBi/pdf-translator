@@ -1,0 +1,89 @@
+# PDF 번역기 설정. 모델명과 검수 기준은 여기서만 바꾸면 됩니다.
+
+# 사용할 모델 프로필. translate.py는 active_profile 하나를, compare.py는 여러 개를 비교합니다.
+# API 키는 각 프로필의 api_key_env 환경변수에만 넣습니다 (채팅·코드에 붙여넣지 마세요).
+active_profile: gemini-3.1-pro
+
+profiles:
+  gemini-3.1-pro:
+    provider: gemini
+    model: gemini-3.1-pro-preview
+    api_key_env: GEMINI_API_KEY
+    vision: true               # 표·2단 편집 페이지를 이미지로 읽을 수 있는지
+  claude-sonnet:
+    provider: anthropic
+    model: claude-sonnet-5-5
+    api_key_env: ANTHROPIC_API_KEY
+    vision: true
+  # 오픈소스 모델 예시: 모델을 호스팅해 주는 서비스(또는 내 PC의 Ollama/vLLM)의 OpenAI 호환 주소를 넣으세요.
+  # 아래 두 값(<...>)을 실제 값으로 바꾸기 전에는 비교에서 자동으로 제외됩니다.
+  open-source:
+    provider: openai_compatible
+    model: "<서비스에서 제공하는 모델 이름>"
+    base_url: "<서비스의 OpenAI 호환 주소>"
+    api_key_env: OPENAI_COMPAT_API_KEY    # 키가 필요 없는 로컬 서버면 이 줄을 지우세요
+    vision: false
+    max_output_tokens: 8000
+
+generation:
+  # Gemini 3 계열은 temperature를 기본값(비워두기)으로 두는 것이 권장됩니다.
+  # 값을 넣고 싶으면 예: 0.3
+  temperature: null
+  max_retries: 4          # API 오류 시 재시도 횟수 (지수 백오프)
+  retry_base_seconds: 2
+
+# 요금은 직접 입력하세요 (100만 토큰당 USD). 비워두면 토큰 수만 보고서에 나옵니다.
+pricing:
+  input_per_million_usd: null
+  output_per_million_usd: null
+  usd_to_krw: null
+
+pipeline:
+  batch_size: 6            # 한 번 호출에 묶는 문단 수
+  context_paragraphs: 2    # 앞 문단 몇 개를 문맥으로 붙일지
+  max_auto_retranslate: 2  # 코드 검수 위반 시 자동 재번역 횟수
+  llm_review: true         # 코드 검수 통과 후 LLM이 모든 문단을 검수
+  abort_after_failed_batches: 3   # 번역 호출이 이만큼 연속 실패하면 중단 (키 오류 등으로 시간·돈 낭비 방지)
+  chunk_pages: 50          # 이 페이지 수마다 끊어서 처리하고 진행 상황 출력
+  use_vision_for_complex_pages: true   # 표/2단 편집 페이지는 이미지로 읽기
+
+extract:
+  skip_references: true        # 참고문헌 이하는 번역하지 않고 원문 유지
+  remove_headers_footers: true
+  header_footer_margin: 0.07   # 페이지 위/아래 7% 영역을 머리글/바닥글 후보로 본다
+  min_paragraph_chars: 2
+
+# 코드 기반 검수 8가지. enabled로 끄고 켜고, 기준값을 조정할 수 있습니다.
+checks:
+  numbers:
+    enabled: true
+  preserve:                  # URL, 인용 [1], 수식 $..$, 코드 `..`, 이메일
+    enabled: true
+  glossary:
+    enabled: true
+  paragraph_count:           # 원문/번역 문단 수 일치 (누락, 중복 탐지)
+    enabled: true
+  length_ratio:
+    enabled: true
+    min_chars_to_check: 20
+    # 번역문 글자수 / 원문 글자수 허용 범위
+    en2ko: {min: 0.35, max: 1.6}
+    ko2en: {min: 1.2, max: 4.0}
+  untranslated:
+    enabled: true
+    max_latin_run: 8         # en2ko에서 영어 단어가 이 개수 이상 연속되면 위반
+    max_hangul_chars: 6      # ko2en에서 한글이 이 글자 수 이상 남으면 위반
+  style:                     # en2ko 전용
+    enabled: true
+    # formal = ~입니다/합니다, plain = ~이다/한다 (논문체)
+    default: formal
+  brackets:
+    enabled: true
+
+score:
+  retry_penalty: 0.3         # 자동 재번역으로 해결된 문단의 감점 비중
+
+# 웹 앱(app.py) 전용 설정
+web:
+  max_pages: 60                  # 한 번에 처리할 최대 쪽 수 (비용·시간 폭주 방지)
+  compare_default_pages: "1-3"   # 모델 비교 탭에서 쪽 범위를 비워두면 이 범위만 사용
