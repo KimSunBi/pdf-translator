@@ -144,7 +144,7 @@ class _Base:
                 if self._non_retryable(exc):
                     break
                 if attempt < self.max_retries:
-                    time.sleep(self.retry_base * (2 ** attempt))
+                    time.sleep(min(60.0, self.retry_base * (2 ** attempt)))
         raise RuntimeError(f"{self.label} 호출 실패({self.model}): {last}")
 
 
@@ -320,9 +320,9 @@ class GoogleWebLLM:
         self.name = name
         self.model = profile.get("model", "google-translate-web")
         self.usage = UsageTracker()
-        self.max_retries = int(profile.get("max_retries", cfg.get("generation", {}).get("max_retries", 4)))
-        self.retry_base = float(profile.get("retry_base_seconds", 2))
-        self.delay = float(profile.get("delay_seconds", 0.3))
+        self.max_retries = int(profile.get("max_retries", 4))
+        self.retry_base = float(profile.get("retry_base_seconds", 5))      # 요청 과다(429)는 오래 쉬어야 풀린다
+        self.delay = float(profile.get("delay_seconds", 1.0))              # 요청 사이 최소 간격(초)
         self._translator = translator          # 테스트용: (text, src, tgt) -> str
 
     # --- 번역 한 건 -------------------------------------------------
@@ -349,6 +349,23 @@ class GoogleWebLLM:
             parts.append(cur)
         return parts
 
+    def _translate_many(self, texts: list[str], src: str, tgt: str) -> list[str]:
+        """여러 문단을 한 번의 요청으로 보내 요청 횟수를 줄인다 (구글은 요청 과다로 막히기 쉽다).
+        문단 사이는 빈 줄로 구분하고, 돌아온 문단 수가 맞지 않으면 문단별로 다시 요청한다."""
+        todo = [i for i, t in enumerate(texts) if re.search(r"[A-Za-z가-힣]", t)]
+        out = list(texts)
+        joined = "\n\n".join(texts[i] for i in todo)
+        if len(todo) > 1 and len(joined) <= self.MAX_CHARS:
+            res = self._translate(joined, src, tgt)
+            parts = [p.strip() for p in re.split(r"\n\s*\n", res) if p.strip()]
+            if len(parts) == len(todo):
+                for i, p in zip(todo, parts):
+                    out[i] = p
+                return out
+        for i in todo:
+            out[i] = self._translate(texts[i], src, tgt)
+        return out
+
     def _translate(self, text: str, src: str, tgt: str) -> str:
         if not re.search(r"[A-Za-z가-힣]", text):
             return text                                  # 숫자·기호뿐이면 그대로
@@ -364,7 +381,7 @@ class GoogleWebLLM:
                 except Exception as exc:
                     last = exc
                     if attempt < self.max_retries:
-                        time.sleep(self.retry_base * (2 ** attempt))
+                        time.sleep(min(60.0, self.retry_base * (2 ** attempt)))
             if last is not None:
                 raise RuntimeError(f"구글 번역 호출 실패: {last.__class__.__name__}: {str(last)[:200]} "
                                    "(많이 쓰면 일시적으로 차단될 수 있습니다. 잠시 뒤 다시 시도하거나 다른 모델을 쓰세요)") from last
@@ -384,8 +401,9 @@ class GoogleWebLLM:
                                            for p in payload.get("paragraphs", [])]}, ensure_ascii=False)
         src, tgt = ("ko", "en") if system and "Korean-to-English" in system else ("en", "ko")
         paras = payload.get("paragraphs") or [payload["paragraph"]]
-        return json.dumps({"translations": [{"id": p["id"], "text": self._translate(p["text"], src, tgt)}
-                                            for p in paras]}, ensure_ascii=False)
+        texts = self._translate_many([p["text"] for p in paras], src, tgt)
+        return json.dumps({"translations": [{"id": p["id"], "text": t} for p, t in zip(paras, texts)]},
+                          ensure_ascii=False)
 
 
 PROVIDERS = {"gemini": GeminiLLM, "anthropic": AnthropicLLM, "openai_compatible": OpenAICompatLLM,

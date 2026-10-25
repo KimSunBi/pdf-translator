@@ -268,3 +268,16 @@ def test_google_profile_is_ready_without_key_and_pipeline_skips_retries(tmp_path
     res = run_pipeline(segs, llm, cfg, progress=lambda m: None)
     assert res.units[0].flagged and not res.units[1].flagged          # 숫자가 틀린 문단은 노란색 표시
     assert res.units[0].retries == 0                                  # 같은 엔진에 재번역을 요청하지 않는다
+
+
+def test_google_adapter_batches_paragraphs_into_one_request_and_falls_back():
+    calls = []
+    llm = _google(lambda t, s, g: calls.append(t) or "\n\n".join(f"번역{k}" for k, _ in enumerate(t.split("\n\n"))))
+    prompt = '<input>{"paragraphs": [{"id": 1, "text": "One."}, {"id": 2, "text": "Two."}, {"id": 3, "text": "Three."}]}</input>'
+    out = json.loads(llm.generate("translate", prompt, system="English-to-Korean", task="translate"))
+    assert [t["text"] for t in out["translations"]] == ["번역0", "번역1", "번역2"] and len(calls) == 1   # 요청 1번
+
+    calls.clear()                                            # 돌아온 문단 수가 다르면 문단별로 다시 요청
+    lossy = _google(lambda t, s, g: calls.append(t) or ("합쳐짐" if "\n\n" in t else "단독"))
+    out = json.loads(lossy.generate("translate", prompt, system="English-to-Korean", task="translate"))
+    assert [t["text"] for t in out["translations"]] == ["단독"] * 3 and len(calls) == 4
