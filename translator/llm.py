@@ -328,6 +328,9 @@ class DryRunLLM:
 
     def generate(self, role, prompt, system=None, images=None, json_mode=False, task=None) -> str:
         self.usage.add(task or role, 0, 0)
+        delay = float(os.environ.get("DRYRUN_DELAY", "0") or 0)       # 진행 화면을 눈으로 확인할 때만 쓰는 인위적 지연(초)
+        if delay:
+            time.sleep(delay)
         if task == "analyze":
             return json.dumps({"summary": "(dry-run)", "doc_type": "document", "domain": "general",
                                "tone": "neutral", "key_terms": []}, ensure_ascii=False)

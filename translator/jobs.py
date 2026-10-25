@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from .runner import RunnerError
 
-MAX_LOG_LINES = 500
+MAX_LOG_LINES = 3000
 KEEP_FINISHED_SECONDS = 3 * 3600
 MAX_JOBS = 30
 
@@ -26,9 +26,11 @@ class Job:
     created: float = field(default_factory=time.time)
     status: str = "running"          # running | done | error
     log: list[str] = field(default_factory=list)
+    times: list[float] = field(default_factory=list)      # log와 같은 순서의 '시작 후 경과 초'
     result: Any = None
     error: str = ""
     finished: float | None = None
+    meta: dict = field(default_factory=dict)
 
     @property
     def elapsed(self) -> float:
@@ -49,15 +51,17 @@ def _cleanup_locked() -> None:
             del _JOBS[j.id]
 
 
-def start_job(kind: str, work: Callable[[Callable[[str], None]], Any]) -> Job:
+def start_job(kind: str, work: Callable[[Callable[[str], None]], Any], meta: dict | None = None) -> Job:
     """work(progress) -> 결과. 스레드에서 실행하고 Job을 바로 돌려준다."""
-    job = Job(id=uuid.uuid4().hex, kind=kind)
+    job = Job(id=uuid.uuid4().hex, kind=kind, meta=dict(meta or {}))
 
     def progress(msg: str) -> None:
         with _LOCK:
             job.log.append(str(msg))
+            job.times.append(time.time() - job.created)
             if len(job.log) > MAX_LOG_LINES:
                 del job.log[: len(job.log) - MAX_LOG_LINES]
+                del job.times[: len(job.times) - MAX_LOG_LINES]
 
     def run() -> None:
         try:
@@ -91,3 +95,9 @@ def get_job(job_id: str | None) -> Job | None:
 def log_tail(job: Job, n: int = 12) -> list[str]:
     with _LOCK:
         return list(job.log[-n:])
+
+
+def snapshot(job: Job) -> tuple[list[str], list[float], float]:
+    """(진행 기록, 각 줄의 경과 초, 지금까지 걸린 초) — 화면에서 그래프를 그릴 때 쓴다."""
+    with _LOCK:
+        return list(job.log), list(job.times), job.elapsed

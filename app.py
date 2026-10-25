@@ -19,6 +19,7 @@ import streamlit as st
 import yaml
 
 from translator import jobs
+from translator.progress import STAGES, Progress, fmt_eta, parse, split_by_model
 from translator.layout import find_font
 from translator.runner import (RunnerError, compare_documents, count_selected_pages, extract_source_md,
                                parse_glossary, ready_profiles, translate_document)
@@ -151,8 +152,8 @@ def _current_job(kind: str):
     return job
 
 
-def _start(kind: str, work) -> None:
-    job = jobs.start_job(kind, work)
+def _start(kind: str, work, meta: dict | None = None) -> None:
+    job = jobs.start_job(kind, work, meta)
     st.session_state[f"job_{kind}"] = job.id
     st.session_state.pop(f"job_{kind}_gone", None)
     st.query_params[f"job_{kind}"] = job.id
@@ -164,14 +165,60 @@ def _fmt_sec(sec: float) -> str:
     return f"{m}분 {s}초" if m else f"{s}초"
 
 
+def _stage_line(p: Progress) -> str:
+    n = len(STAGES) if p.with_pdf else len(STAGES) - 1
+    parts = []
+    for k, name in enumerate(STAGES[:n]):
+        if p.finished or k < p.stage:
+            parts.append(f"✅ {name}")
+        elif k == p.stage:
+            extra = f" {p.done}/{p.total}" if k == 2 and p.total else ""
+            parts.append(f"⏳ **{name}{extra}**")
+        else:
+            parts.append(f"⬜ {name}")
+    return " → ".join(parts)
+
+
+def _render_progress(p: Progress, elapsed: float, label: str = "") -> None:
+    eta = p.eta_seconds(elapsed)
+    prefix = f"{label} · " if label else ""
+    st.progress(min(1.0, p.percent / 100), text=f"{prefix}{p.percent:.0f}% · 경과 {_fmt_sec(elapsed)}"
+                f"{' · 남은 시간 ' + fmt_eta(eta) if p.stage == 2 else ''}")
+    st.markdown(_stage_line(p))
+
+
 @st.fragment(run_every=2)
 def _monitor(kind: str, title: str) -> None:
+    import pandas as pd
+
     job = jobs.get_job(_job_id(kind))
     if job is None or job.status != "running":
         st.rerun()                      # 끝났으면 전체 화면을 다시 그려 결과를 보여준다
         return
-    st.info(f"{title} ({_fmt_sec(job.elapsed)} 경과) — 다른 탭으로 가거나 새로고침해도 계속 진행됩니다.")
-    st.code("\n".join(jobs.log_tail(job)) or "시작하는 중…", language=None)
+    log, times, elapsed = jobs.snapshot(job)
+    st.info(f"{title} — 다른 탭으로 가거나 새로고침해도 계속 진행됩니다.")
+    if kind == "cmp":
+        groups = split_by_model(log, times)
+        models = {k: v for k, v in groups.items() if k}
+        if not models:
+            st.progress(0.05, text=f"PDF 읽는 중 · 경과 {_fmt_sec(elapsed)}")
+        series = {}
+        for name, (lines, ts) in models.items():
+            p = parse(lines, ts)
+            _render_progress(p, elapsed - (ts[0] if ts else 0), label=name)
+            if len(p.points) >= 2:
+                series[name] = pd.Series({round(t, 1): d for t, d in p.points})
+        if series:
+            df = pd.concat(series, axis=1).sort_index().ffill().fillna(0)
+            st.line_chart(df, height=200, x_label="경과 시간(초)", y_label="번역·검사를 끝낸 단위 수")
+    else:
+        p = parse(log, times, with_pdf=bool(job.meta.get("with_pdf")))
+        _render_progress(p, elapsed)
+        if len(p.points) >= 2:
+            df = pd.DataFrame({"번역·검사를 끝낸 단위 수": [d for _, d in p.points]}, index=[round(t, 1) for t, _ in p.points])
+            st.line_chart(df, height=200, x_label="경과 시간(초)", y_label="끝낸 단위 수")
+    with st.expander("자세한 기록"):
+        st.code("\n".join(jobs.log_tail(job, 25)) or "시작하는 중…", language=None)
 
 
 def _show_job(kind: str, title: str):
@@ -324,7 +371,7 @@ def main() -> None:
                 finally:
                     shutil.rmtree(tmp, ignore_errors=True)
 
-            _start("tr", work_tr)
+            _start("tr", work_tr, {"with_pdf": bool(make_pdf_out)})
 
         tr = _show_job("tr", "번역 중입니다")
         if tr:

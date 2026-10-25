@@ -62,3 +62,24 @@ def test_log_is_capped():
 
     job = wait_done(jobs.start_job("t", work))
     assert len(job.log) == jobs.MAX_LOG_LINES and job.log[-1] == str(jobs.MAX_LOG_LINES + 49)
+
+
+def test_progress_parsing_stages_percent_and_eta():
+    from translator.progress import fmt_eta, parse, split_by_model
+    log = ["PDF 읽는 중", "추출 완료: 문단 8, 표 1, 원문 유지 2", "[1/4] 문서 분석 중 (요약·분야·핵심 용어)",
+           "[2/4] 번역 중 (문단 8개, 표 셀 4개)", "      6/12 번역·검사 완료 (현재 1쪽)"]
+    times = [0, 2, 3, 8, 28]
+    p = parse(log, times, with_pdf=True)
+    assert (p.stage, p.done, p.total) == (2, 6, 12)
+    assert 10 < p.percent < 60 and not p.finished
+    assert round(p.eta_seconds(30)) == round((12 - 6) * (30 - 8) / 6)         # 번역 시작 이후의 속도로 추정
+    assert fmt_eta(None) == "계산 중" and fmt_eta(75) == "약 1분 15초"
+    done = parse(log + ["[3/4] LLM 검수 중 (12개)", "[4/4] 마무리", "원본 모양 PDF: 9곳 배치"], times + [40, 45, 50], with_pdf=True)
+    assert done.finished and done.percent == 100.0
+
+
+def test_progress_split_by_model():
+    from translator.progress import split_by_model
+    log = ["PDF 읽는 중", "===== a (m) =====", "[a] [1/4] 문서 분석 중", "[b] [2/4] 번역 중 (문단 3개, 표 셀 0개)"]
+    groups = split_by_model(log, [0, 1, 2, 3])
+    assert set(groups) == {"", "a", "b"} and groups["a"][0] == ["[1/4] 문서 분석 중"]
