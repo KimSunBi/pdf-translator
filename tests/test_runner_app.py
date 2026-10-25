@@ -34,7 +34,7 @@ def test_parse_glossary_both_directions_and_bom():
 def test_translate_document_dry_run_writes_all_files(pdf, tmp_path):
     msgs = []
     res = translate_document(pdf, CFG, dry_run=True, out_dir=str(tmp_path / "o"), progress=msgs.append)
-    assert set(res.files) == {"docx", "md", "report", "csv", "json"}
+    assert set(res.files) == {"docx", "md", "report", "csv", "json", "source_md"}
     assert all(os.path.getsize(p) > 50 for p in res.files.values())
     assert res.stats["total"] == 4 and any("번역" in m for m in msgs)
 

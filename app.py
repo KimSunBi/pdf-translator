@@ -19,8 +19,9 @@ import streamlit as st
 import yaml
 
 from translator import jobs
-from translator.runner import (RunnerError, compare_documents, count_selected_pages, parse_glossary,
-                               ready_profiles, translate_document)
+from translator.layout import find_font
+from translator.runner import (RunnerError, compare_documents, count_selected_pages, extract_source_md,
+                               parse_glossary, ready_profiles, translate_document)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SECRET_ENV_KEYS = ["GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_COMPAT_API_KEY"]
@@ -256,12 +257,47 @@ def main() -> None:
             st.info("사용할 수 있는 모델이 없습니다. Secrets에 API 키를 넣거나, 고급 옵션에서 테스트 모드를 켜세요.")
         profile = st.selectbox("모델", ready or ["(없음)"], disabled=not ready,
                                help="config.yaml의 profiles에 정의된 모델 중 키가 설정된 것만 보입니다.")
+        make_pdf_out = st.checkbox("원본 모양 PDF도 만들기 (글자가 선택되는 PDF만 · 표와 2단은 이미지 읽기 없이 글자 위치로 처리)",
+                                   value=True, key="make_pdf_out")
+        _font_path, _font_label = find_font()
+        if make_pdf_out:
+            if _font_label == "함초롬바탕":
+                st.caption("글꼴: 함초롬바탕")
+            else:
+                st.caption(f"글꼴: {_font_label or '없음 — fonts/ 폴더에 HCRBatang.ttf를 넣어주세요'}")
+
+        with st.expander("원문 확인·수정 (선택) — 번역 전에 읽은 내용을 고치고 싶을 때"):
+            st.write("1) 아래 버튼으로 PDF에서 읽은 원문을 MD로 받고 (API 비용 없음), 2) 잘못 읽힌 곳을 고쳐서, "
+                     "3) 수정본을 올린 뒤 번역을 시작하세요. `<!-- p:3 -->` 같은 표시는 지우지 마세요.")
+            if st.button("원문 MD 만들기", disabled=(up is None), key="make_src"):
+                try:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        pdf_path = os.path.join(tmp, f"{stem}.pdf")
+                        with open(pdf_path, "wb") as f:
+                            f.write(up.getvalue())
+                        with st.spinner("PDF 읽는 중"):
+                            md_text, md_warn = extract_source_md(pdf_path, cfg, pages=pages_clean or None,
+                                                                 direction=direction, max_pages=max_pages,
+                                                                 progress=lambda m: None)
+                    st.session_state["src_md"] = {"text": md_text, "warn": md_warn, "name": f"{stem}.source.md"}
+                except RunnerError as exc:
+                    st.error(str(exc))
+            sm = st.session_state.get("src_md")
+            if sm:
+                for w in sm["warn"]:
+                    st.warning(w)
+                st.download_button("원문 MD 받기", sm["text"].encode("utf-8"), file_name=sm["name"], key="dl_src_md",
+                                   mime="text/markdown")
+            md_up = st.file_uploader("수정한 원문 MD (선택)", type=["md", "txt"], key="md_up")
+        source_md_text = md_up.getvalue().decode("utf-8-sig", errors="replace") if md_up is not None else None
+
         run_tr = st.button("번역 시작", type="primary", key="run_tr",
                            disabled=(up is None or (not ready and not dry_run) or _is_running("tr")))
         if run_tr:
             data = up.getvalue()
             kw = dict(profile=None if dry_run else profile, direction=direction, domain=domain, style=style,
-                      glossary=glossary, pages=pages_clean or None, dry_run=dry_run, max_pages=max_pages)
+                      glossary=glossary, pages=pages_clean or None, dry_run=dry_run, max_pages=max_pages,
+                      layout=bool(make_pdf_out), source_md=source_md_text)
             cfg_run = cfg
 
             def work_tr(progress, data=data, kw=kw, cfg_run=cfg_run, stem=stem):
@@ -279,6 +315,11 @@ def main() -> None:
                         "csv": _read_bytes(res.files["csv"]), "report": _read_text(res.files["report"]),
                         "docx_name": os.path.basename(res.files["docx"]),
                         "md_name": os.path.basename(res.files["md"]),
+                        "src_md": _read_bytes(res.files["source_md"]),
+                        "src_md_name": os.path.basename(res.files["source_md"]),
+                        "pdf": _read_bytes(res.files["pdf"]) if "pdf" in res.files else None,
+                        "pdf_name": os.path.basename(res.files["pdf"]) if "pdf" in res.files else "",
+                        "layout_font": res.layout_font,
                     }
                 finally:
                     shutil.rmtree(tmp, ignore_errors=True)
@@ -299,13 +340,17 @@ def main() -> None:
                        f" · 예상 비용 {_fmt_cost(s)}")
             for w in tr["warnings"]:
                 st.warning(w)
-            d1, d2, d3, d4 = st.columns(4)
+            if tr.get("pdf"):
+                st.download_button(f"원본 모양 번역 PDF ({tr['layout_font'] or '글꼴'})", tr["pdf"], file_name=tr["pdf_name"],
+                                   key="dl_pdf", mime="application/pdf", type="primary")
+            d1, d2, d3, d4, d5 = st.columns(5)
             d1.download_button("Word (.docx)", tr["docx"], file_name=tr["docx_name"], key="dl_docx",
                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
             d2.download_button("마크다운 (.md)", tr["md"], file_name=tr["md_name"], key="dl_md", mime="text/markdown")
-            d3.download_button("검수 보고서 (.html)", tr["report"], file_name="report.html", key="dl_report",
+            d3.download_button("원문 (.md)", tr["src_md"], file_name=tr["src_md_name"], key="dl_srcmd", mime="text/markdown")
+            d4.download_button("검수 보고서 (.html)", tr["report"], file_name="report.html", key="dl_report",
                                mime="text/html")
-            d4.download_button("문단별 내역 (.csv)", tr["csv"], file_name="report.csv", key="dl_csv", mime="text/csv")
+            d5.download_button("문단별 내역 (.csv)", tr["csv"], file_name="report.csv", key="dl_csv", mime="text/csv")
             st.subheader("검수 보고서 · 원문·번역문 비교 (노란색 = 확인 필요)")
             _show_html(tr["report"], 760)
 

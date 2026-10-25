@@ -13,10 +13,12 @@ import pymupdf
 
 from .compare_report import ProfileRun, split_deepl_text, write_compare_html
 from .extract import extract_pdf, parse_pages
+from .layout import build_layout_pdf, find_font
 from .llm import DryRunLLM, make_llm, profile_cfg, profile_ready, resolve_profile
 from .outputs import write_docx, write_markdown
 from .pipeline import run_pipeline
 from .report import compute_stats, write_csv_report, write_html_report
+from .sourcemd import apply_md, segments_to_md
 
 
 class RunnerError(Exception):
@@ -97,13 +99,27 @@ class TranslateResult:
     elapsed: str
     files: dict[str, str] = field(default_factory=dict)   # docx, md, report, csv, json
     warnings: list[str] = field(default_factory=list)
+    layout_font: str = ""
+
+
+def extract_source_md(pdf_path: str, cfg: dict, *, pages: str | None = None, direction: str = "en2ko",
+                      max_pages: int | None = None, progress: Callable[[str], None] = print) -> tuple[str, list[str]]:
+    """API 없이 PDF에서 원문만 읽어 확인·수정용 MD를 만든다. (MD 텍스트, 경고)"""
+    _check_page_limit(pdf_path, pages, max_pages)
+    progress("PDF 읽는 중")
+    segments, warnings = extract_pdf(pdf_path, cfg, llm=None, pages=pages, direction=direction,
+                                     progress=progress, with_layout=True)
+    if not segments:
+        raise RunnerError("읽을 내용이 없습니다. 스캔본(이미지 PDF)이면 아직 지원하지 않습니다(OCR은 3단계 예정).")
+    stem = os.path.splitext(os.path.basename(pdf_path))[0]
+    return segments_to_md(segments, stem), warnings
 
 
 def translate_document(
     pdf_path: str, cfg: dict, *, profile: str | None = None, direction: str = "en2ko",
     domain: str = "", style: str = "formal", glossary: list[tuple[str, str]] | None = None,
     pages: str | None = None, out_dir: str, dry_run: bool = False, max_pages: int | None = None,
-    progress: Callable[[str], None] = print, llm=None,
+    progress: Callable[[str], None] = print, llm=None, layout: bool = False, source_md: str | None = None,
 ) -> TranslateResult:
     _check_page_limit(pdf_path, pages, max_pages)
     os.makedirs(out_dir, exist_ok=True)
@@ -117,9 +133,14 @@ def translate_document(
 
     progress("PDF 읽는 중")
     use_llm = llm if (not dry_run and getattr(llm, "supports_vision", False)) else None
-    segments, warnings = extract_pdf(pdf_path, cfg, llm=use_llm, pages=pages, direction=direction, progress=progress)
+    segments, warnings = extract_pdf(pdf_path, cfg, llm=use_llm, pages=pages, direction=direction, progress=progress,
+                                     with_layout=layout)
     if not segments:
         raise RunnerError("번역할 내용이 없습니다. 스캔본(이미지 PDF)이면 아직 지원하지 않습니다(OCR은 3단계 예정).")
+    if source_md and source_md.strip():
+        n_changed, md_warn = apply_md(segments, source_md)
+        warnings += [f"원문 MD: {w}" for w in md_warn]
+        progress(f"수정한 원문 MD 반영: {n_changed}곳")
     progress(f"추출 완료: 문단 {sum(s.kind == 'text' for s in segments)}, 표 {sum(s.kind == 'table' for s in segments)}, "
              f"원문 유지 {sum(s.kind == 'keep' for s in segments)}")
 
@@ -142,7 +163,23 @@ def translate_document(
         "report": os.path.join(out_dir, "report.html"),
         "csv": os.path.join(out_dir, "report.csv"),
         "json": os.path.join(out_dir, "result.json"),
+        "source_md": os.path.join(out_dir, f"{stem}.source.md"),
     }
+    with open(files["source_md"], "w", encoding="utf-8") as f:
+        f.write(segments_to_md(segments, stem))
+    layout_font = ""
+    if layout:
+        files["pdf"] = os.path.join(out_dir, f"{stem}.{lang}.layout.pdf")
+        try:
+            lrep = build_layout_pdf(pdf_path, result.rendered(), files["pdf"],
+                                    min_scale=float((cfg.get("layout") or {}).get("min_scale", 0.6)), progress=progress)
+            layout_font = lrep.font_label
+            warnings += lrep.overflow
+            if lrep.skipped:
+                warnings.append(f"원본 모양 PDF: 위치 정보가 없는 {lrep.skipped}곳은 원문 그대로 남았습니다")
+        except Exception as exc:        # 원본 모양 PDF가 실패해도 Word·보고서는 그대로 낸다
+            files.pop("pdf", None)
+            warnings.append(f"원본 모양 PDF를 만들지 못했습니다: {exc.__class__.__name__}: {exc}")
     write_docx(result, files["docx"], stem)
     write_markdown(result, files["md"], stem)
     write_html_report(result, stats, files["report"], stem, meta)
@@ -152,7 +189,7 @@ def translate_document(
                    "units": [{"page": u.page, "kind": u.kind, "src": u.src, "tgt": u.tgt,
                               "flagged": u.flagged, "retries": u.retries} for u in result.units]},
                   f, ensure_ascii=False, indent=1)
-    return TranslateResult(stem, out_dir, pname, llm.model, stats, elapsed, files, warnings)
+    return TranslateResult(stem, out_dir, pname, llm.model, stats, elapsed, files, warnings, layout_font)
 
 
 # ------------------------------------------------------------------ 모델 비교

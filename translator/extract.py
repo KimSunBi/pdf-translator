@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 import pymupdf
@@ -33,6 +33,9 @@ class Segment:
     page: int                      # 1부터 시작하는 쪽 번호
     text: str = ""
     rows: list[list[str]] | None = None
+    # 원본 모양 PDF를 만들 때 쓰는 위치 정보: (0부터 시작하는 쪽 인덱스, x0, y0, x1, y1, 글자 크기)
+    boxes: list = field(default_factory=list)
+    cells: list | None = None          # 표 셀의 (x0, y0, x1, y1) — rows와 같은 모양, 없는 칸은 None
 
 
 def parse_pages(spec: str | None, n_pages: int) -> list[int]:
@@ -63,15 +66,47 @@ def _norm_margin(text: str) -> str:
     return re.sub(r"\d+", "#", text.strip().lower())
 
 
-def _text_blocks(page) -> list[tuple[float, float, float, float, str]]:
+def _block_font_sizes(page) -> dict[int, float]:
+    """블록 번호 → 글자 수로 가중한 평균 글자 크기."""
+    sizes: dict[int, float] = {}
+    try:
+        for db in page.get_text("dict")["blocks"]:
+            if db.get("type") != 0:
+                continue
+            total = chars = 0.0
+            for ln in db.get("lines", []):
+                for sp in ln.get("spans", []):
+                    n = len(sp.get("text", "").strip())
+                    total += float(sp.get("size", 0)) * n
+                    chars += n
+            if chars:
+                sizes[db["number"]] = total / chars
+    except Exception:
+        pass
+    return sizes
+
+
+def _text_blocks(page) -> list[tuple[float, float, float, float, str, float]]:
+    """(x0, y0, x1, y1, 텍스트, 글자 크기)."""
+    sizes = _block_font_sizes(page)
     out = []
     for b in page.get_text("blocks"):
         if b[6] != 0:          # 0 = 텍스트 블록
             continue
         text = _clean_block_text(b[4])
         if text:
-            out.append((b[0], b[1], b[2], b[3], text))
+            out.append((b[0], b[1], b[2], b[3], text, sizes.get(b[5], 10.0)))
     return out
+
+
+def _table_cells(t, rows) -> list | None:
+    try:
+        cells = [[tuple(float(v) for v in c) if c else None for c in row.cells] for row in t.rows]
+    except Exception:
+        return None
+    if len(cells) != len(rows) or any(len(c) != len(r) for c, r in zip(cells, rows)):
+        return None
+    return cells
 
 
 def _order_blocks(blocks, width: float) -> tuple[list, bool]:
@@ -161,11 +196,12 @@ def extract_pdf(
     pages: str | None = None,
     direction: str = "en2ko",
     progress: Callable[[str], None] = print,
+    with_layout: bool = False,
 ) -> tuple[list[Segment], list[str]]:
-    """(세그먼트 목록, 경고 목록)."""
+    """(세그먼트 목록, 경고 목록). with_layout이면 위치 정보가 필요하므로 이미지 읽기를 쓰지 않는다."""
     ecfg = cfg.get("extract", {})
     pcfg = cfg.get("pipeline", {})
-    use_vision = bool(pcfg.get("use_vision_for_complex_pages", True)) and llm is not None
+    use_vision = bool(pcfg.get("use_vision_for_complex_pages", True)) and llm is not None and not with_layout
     margin = float(ecfg.get("header_footer_margin", 0.07))
     min_chars = int(ecfg.get("min_paragraph_chars", 2))
 
@@ -197,7 +233,7 @@ def extract_pdf(
         return len(idxs) >= 2 and margin_counts.get(_norm_margin(block[4]), 0) >= 2
 
     # 2) 페이지별 추출
-    raw: list[tuple[int, str, str, list | None]] = []   # (쪽, kind, text, rows)
+    raw: list[tuple[int, str, str, list | None, list | None]] = []   # (쪽, kind, text, rows, 위치 정보)
     for n, i in enumerate(idxs, 1):
         page = doc[i]
         w, h = page.rect.width, page.rect.height
@@ -215,26 +251,26 @@ def extract_pdf(
             progress(f"  {i + 1}쪽: {reason} 페이지 → 이미지로 읽는 중")
             try:
                 for kind, text, rows in _vision_page(llm, page, i + 1, direction):
-                    raw.append((i + 1, kind, text, rows))
+                    raw.append((i + 1, kind, text, rows, None))
                 continue
             except Exception as exc:  # 실패하면 텍스트 추출로 대체
                 warnings.append(f"{i + 1}쪽: 이미지 읽기 실패({exc.__class__.__name__}) → 텍스트 추출로 대체")
 
         # 텍스트 추출 경로 (표는 find_tables 결과를 셀 단위로 보관)
         table_boxes = [t.bbox for t in tables]
-        items: list[tuple[float, str, str, list | None]] = []
+        items: list[tuple] = []
         for t in tables:
             try:
                 rows = [[(c or "").replace("\n", " ").strip() for c in row] for row in t.extract()]
             except Exception:
                 rows = []
             if rows:
-                items.append((t.bbox[1], "table", "", rows))
+                items.append((t.bbox[1], "table", "", rows, _table_cells(t, rows)))
         pos = {id(b): k for k, b in enumerate(ordered)}
         for b in ordered:
             if any(_in_bbox(b, tb) for tb in table_boxes):
                 continue
-            items.append((float(pos[id(b)]) - 1e6, "text", b[4], None))   # 읽는 순서 유지
+            items.append((float(pos[id(b)]) - 1e6, "text", b[4], None, [(i, b[0], b[1], b[2], b[3], b[5])]))   # 읽는 순서 유지
         # 표는 같은 쪽에서 위치(y)에 가장 가까운 블록 뒤에 넣는다
         text_items = [it for it in items if it[1] == "text"]
         table_items = [it for it in items if it[1] == "table"]
@@ -250,17 +286,17 @@ def extract_pdf(
                     insert_at = k
                     break
             merged.insert(insert_at, t_item)
-        for _, kind, text, rows in merged:
-            raw.append((i + 1, kind, text, rows))
+        for _, kind, text, rows, extra in merged:
+            raw.append((i + 1, kind, text, rows, extra))
 
     # 3) 쪽을 넘어 이어지는 문단 병합, 참고문헌 이하는 keep 처리
     segments: list[Segment] = []
     in_refs = False
-    for page_no, kind, text, rows in raw:
+    for page_no, kind, text, rows, extra in raw:
         if kind == "text" and ecfg.get("skip_references", True):
             if text.strip().rstrip(":").lower() in REF_HEADINGS:
                 in_refs = True
-                segments.append(Segment(0, "text", page_no, text))
+                segments.append(Segment(0, "text", page_no, text, boxes=list(extra or [])))
                 continue
         if in_refs and kind != "table":
             kind = "keep"
@@ -271,8 +307,12 @@ def extract_pdf(
             if (prev and prev.kind == "text" and not _TERMINAL.search(prev.text)
                     and text[:1].islower()):
                 prev.text = f"{prev.text} {text}"
+                prev.boxes += list(extra or [])
                 continue
-        segments.append(Segment(0, kind, page_no, text, rows))
+        if kind == "table":
+            segments.append(Segment(0, kind, page_no, text, rows, cells=extra))
+        else:
+            segments.append(Segment(0, kind, page_no, text, rows, boxes=list(extra or []) if kind == "text" else []))
 
     for k, seg in enumerate(segments):
         seg.id = k
