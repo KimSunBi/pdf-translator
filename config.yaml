@@ -15,6 +15,12 @@ profiles:
     model: claude-sonnet-5-5
     api_key_env: ANTHROPIC_API_KEY
     vision: true
+  # 구글 번역(웹). API 키 불필요. LLM이 아니라서 용어집·문체·문맥을 따르지 못하고, 코드 검수만 돌립니다.
+  # 비공식 웹 주소를 쓰므로 많이 쓰면 차단될 수 있습니다. 품질은 LLM보다 낮을 수 있습니다.
+  google-translate:
+    provider: google_translate_web
+    model: google-translate-web
+    vision: false
   # 오픈소스 모델 예시: 모델을 호스팅해 주는 서비스(또는 내 PC의 Ollama/vLLM)의 OpenAI 호환 주소를 넣으세요.
   # 아래 두 값(<...>)을 실제 값으로 바꾸기 전에는 비교에서 자동으로 제외됩니다.
   open-source:

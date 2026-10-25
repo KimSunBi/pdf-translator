@@ -83,6 +83,21 @@ def _check_page_limit(pdf_path: str, pages: str | None, max_pages: int | None) -
     return n
 
 
+def cfg_for(cfg: dict, llm) -> dict:
+    """모델에 따라 파이프라인 설정을 조정한다 (예: 구글 번역은 LLM 검수·자동 재번역·문체 검사를 끈다)."""
+    over = getattr(llm, "pipeline_overrides", None)
+    off = getattr(llm, "checks_off", ())
+    if not over and not off:
+        return cfg
+    import copy
+
+    out = copy.deepcopy(cfg)
+    out["pipeline"].update(over or {})
+    for name in off:
+        out.setdefault("checks", {}).setdefault(name, {})["enabled"] = False
+    return out
+
+
 def _direction_label(direction: str) -> str:
     return "영어 → 한국어" if direction == "en2ko" else "한국어 → 영어"
 
@@ -145,7 +160,7 @@ def translate_document(
              f"원문 유지 {sum(s.kind == 'keep' for s in segments)}")
 
     try:
-        result = run_pipeline(segments, llm, cfg, direction=direction, domain=domain, style=style,
+        result = run_pipeline(segments, llm, cfg_for(cfg, llm), direction=direction, domain=domain, style=style,
                               user_glossary=glossary or [], progress=progress)
     except RuntimeError as exc:
         raise RunnerError(str(exc)) from exc
@@ -259,7 +274,7 @@ def compare_documents(
         progress(f"===== {llm.name} ({llm.model}) =====")
         t0 = time.time()
         try:
-            result = run_pipeline(segments, llm, cfg, direction=direction, domain=domain, style=style,
+            result = run_pipeline(segments, llm, cfg_for(cfg, llm), direction=direction, domain=domain, style=style,
                                   user_glossary=glossary or [],
                                   progress=lambda m, n=llm.name: progress(f"[{n}] {m}"))
         except Exception as exc:     # 한 모델이 실패해도 나머지 비교는 계속

@@ -83,9 +83,11 @@ def test_compare_documents_without_ready_profiles(pdf, tmp_path, monkeypatch):
     for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_COMPAT_API_KEY"):
         monkeypatch.delenv(k, raising=False)
     names, skipped = ready_profiles(CFG)
-    assert names == [] and set(skipped) == set(CFG["profiles"])
+    assert names == ["google-translate"]                 # 키가 필요 없는 구글 번역만 바로 쓸 수 있다
+    assert set(skipped) == set(CFG["profiles"]) - {"google-translate"}
+    only = {**CFG, "profiles": {k: v for k, v in CFG["profiles"].items() if k != "google-translate"}}
     with pytest.raises(RunnerError, match="비교할 수 있는 프로필이 없습니다"):
-        compare_documents(pdf, CFG, out_dir=str(tmp_path / "c"), progress=lambda m: None)
+        compare_documents(pdf, only, out_dir=str(tmp_path / "c"), progress=lambda m: None)
 
 
 def test_compare_one_model_failing_does_not_stop_others(pdf, tmp_path):

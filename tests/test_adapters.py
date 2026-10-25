@@ -205,3 +205,66 @@ def test_auth_errors_fail_fast_without_retrying():
     llm2.retry_base = 0
     assert json.loads(llm2.generate("translate", "x", task="translate")) == {"ok": True}
     assert flaky.attempts == 3
+
+
+# ---------------------------------------------------------------- 구글 번역(웹) 어댑터
+
+def _google(fn, **prof):
+    from translator.llm import GoogleWebLLM
+    profile = {"provider": "google_translate_web", "model": "google-translate-web", "delay_seconds": 0, **prof}
+    llm = GoogleWebLLM(CFG, "google-translate", profile, translator=fn)
+    llm.retry_base = 0
+    return llm
+
+
+def test_google_adapter_translates_batch_and_skips_review_analyze():
+    seen = []
+    llm = _google(lambda t, s, g: seen.append((t, s, g)) or f"번역:{t}")
+    prompt = '<input>{"paragraphs": [{"id": 1, "text": "Hello world."}, {"id": 2, "text": "1,200"}]}</input>'
+    out = json.loads(llm.generate("translate", prompt, system="English-to-Korean translator", task="translate"))
+    assert out["translations"] == [{"id": 1, "text": "번역:Hello world."}, {"id": 2, "text": "1,200"}]   # 숫자뿐인 문단은 그대로
+    assert seen == [("Hello world.", "en", "ko")]
+    assert json.loads(llm.generate("analyze", "x", task="analyze"))["key_terms"] == []
+    rev = json.loads(llm.generate("review", '<input>{"paragraphs": [{"id": 5}]}</input>', task="review"))
+    assert rev["reviews"][0]["ok"] is True
+    seen.clear()
+    llm.generate("translate", '<input>{"paragraphs": [{"id": 1, "text": "안녕하세요"}]}</input>',
+                 system="Korean-to-English translator", task="translate")
+    assert seen == [("안녕하세요", "ko", "en")]
+
+
+def test_google_adapter_splits_long_text_and_retries_then_fails_clearly():
+    calls = []
+    llm = _google(lambda t, s, g: calls.append(len(t)) or t)
+    long_text = " ".join(["This is a sentence."] * 400)           # 4500자 초과
+    out = llm._translate(long_text, "en", "ko")
+    assert len(calls) >= 2 and max(calls) <= 4500 and out.count("This is a sentence.") == 400
+
+    attempts = []
+
+    def flaky(t, s, g):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise RuntimeError("429 too many requests")
+        return "ok"
+
+    assert _google(flaky, max_retries=3)._translate("Hello", "en", "ko") == "ok" and len(attempts) == 3
+
+    def blocked(t, s, g):
+        raise RuntimeError("blocked")
+    with pytest.raises(RuntimeError, match="구글 번역 호출 실패"):
+        _google(blocked, max_retries=1)._translate("Hello", "en", "ko")
+
+
+def test_google_profile_is_ready_without_key_and_pipeline_skips_retries(tmp_path):
+    from translator.runner import cfg_for
+    ok, _ = profile_ready(CFG["profiles"]["google-translate"])
+    assert ok
+    llm = _google(lambda t, s, g: "연구에는 학생 999명이 참여했습니다." if "1,200" in t else "좋은 번역입니다.")
+    cfg = cfg_for(CFG, llm)
+    assert cfg["pipeline"]["llm_review"] is False and cfg["pipeline"]["max_auto_retranslate"] == 0
+    assert cfg["checks"]["style"]["enabled"] is False and CFG["checks"]["style"]["enabled"] is True   # 원본은 그대로
+    segs = [Segment(0, "text", 1, "The study enrolled 1,200 students."), Segment(1, "text", 1, "Feedback helps learners.")]
+    res = run_pipeline(segs, llm, cfg, progress=lambda m: None)
+    assert res.units[0].flagged and not res.units[1].flagged          # 숫자가 틀린 문단은 노란색 표시
+    assert res.units[0].retries == 0                                  # 같은 엔진에 재번역을 요청하지 않는다

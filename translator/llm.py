@@ -304,7 +304,92 @@ class OpenAICompatLLM(_Base):
 
 # ------------------------------------------------------------------ 팩토리
 
-PROVIDERS = {"gemini": GeminiLLM, "anthropic": AnthropicLLM, "openai_compatible": OpenAICompatLLM}
+class GoogleWebLLM:
+    """구글 번역(웹)으로 번역하는 어댑터. API 키가 필요 없다 (deep-translator 사용).
+
+    LLM이 아니라서 문맥·용어집·문체 지시를 따르지 못한다. 그래서 파이프라인에서는 분석·LLM 검수·자동 재번역을
+    건너뛰고(pipeline_overrides), 코드 검수(숫자·보존·누락·길이 등)만 돌려 문제 문단을 노란색으로 표시한다.
+    구글의 비공식 웹 주소를 쓰므로 많이 쓰면 차단될 수 있고, 예고 없이 막힐 수 있다.
+    """
+    supports_vision = False
+    MAX_CHARS = 4500
+    pipeline_overrides = {"llm_review": False, "max_auto_retranslate": 0}
+    checks_off = ("style",)
+
+    def __init__(self, cfg: dict, name: str, profile: dict, translator=None) -> None:
+        self.name = name
+        self.model = profile.get("model", "google-translate-web")
+        self.usage = UsageTracker()
+        self.max_retries = int(profile.get("max_retries", cfg.get("generation", {}).get("max_retries", 4)))
+        self.retry_base = float(profile.get("retry_base_seconds", 2))
+        self.delay = float(profile.get("delay_seconds", 0.3))
+        self._translator = translator          # 테스트용: (text, src, tgt) -> str
+
+    # --- 번역 한 건 -------------------------------------------------
+    def _call(self, text: str, src: str, tgt: str) -> str:
+        if self._translator is not None:
+            return self._translator(text, src, tgt)
+        try:
+            from deep_translator import GoogleTranslator
+        except ImportError as exc:
+            raise RuntimeError("deep-translator 패키지가 없습니다. requirements.txt를 설치하세요.") from exc
+        return GoogleTranslator(source=src, target=tgt).translate(text) or ""
+
+    def _chunks(self, text: str) -> list[str]:
+        if len(text) <= self.MAX_CHARS:
+            return [text]
+        parts, cur = [], ""
+        for sent in re.split(r"(?<=[.!?。])\s+", text):
+            if cur and len(cur) + len(sent) + 1 > self.MAX_CHARS:
+                parts.append(cur)
+                cur = sent
+            else:
+                cur = f"{cur} {sent}".strip()
+        if cur:
+            parts.append(cur)
+        return parts
+
+    def _translate(self, text: str, src: str, tgt: str) -> str:
+        if not re.search(r"[A-Za-z가-힣]", text):
+            return text                                  # 숫자·기호뿐이면 그대로
+        out = []
+        for chunk in self._chunks(text):
+            last: Exception | None = None
+            for attempt in range(self.max_retries + 1):
+                try:
+                    out.append(self._call(chunk, src, tgt))
+                    self.usage.add("translate", len(chunk), 0)      # 토큰 대신 글자 수를 센다
+                    last = None
+                    break
+                except Exception as exc:
+                    last = exc
+                    if attempt < self.max_retries:
+                        time.sleep(self.retry_base * (2 ** attempt))
+            if last is not None:
+                raise RuntimeError(f"구글 번역 호출 실패: {last.__class__.__name__}: {str(last)[:200]} "
+                                   "(많이 쓰면 일시적으로 차단될 수 있습니다. 잠시 뒤 다시 시도하거나 다른 모델을 쓰세요)") from last
+            if self.delay:
+                time.sleep(self.delay)
+        return " ".join(out)
+
+    # --- LLM 인터페이스 ---------------------------------------------
+    def generate(self, role, prompt, system=None, images=None, json_mode=False, task=None) -> str:
+        if task == "analyze":
+            return json.dumps({"summary": "", "doc_type": "", "domain": "", "tone": "", "key_terms": []})
+        if task == "vision":
+            return json.dumps({"items": []})
+        payload = json.loads(re.search(r"<input>\s*(.*?)\s*</input>", prompt, re.S).group(1))
+        if task == "review":
+            return json.dumps({"reviews": [{"id": p["id"], "ok": True, "issue": "", "fixed": ""}
+                                           for p in payload.get("paragraphs", [])]}, ensure_ascii=False)
+        src, tgt = ("ko", "en") if system and "Korean-to-English" in system else ("en", "ko")
+        paras = payload.get("paragraphs") or [payload["paragraph"]]
+        return json.dumps({"translations": [{"id": p["id"], "text": self._translate(p["text"], src, tgt)}
+                                            for p in paras]}, ensure_ascii=False)
+
+
+PROVIDERS = {"gemini": GeminiLLM, "anthropic": AnthropicLLM, "openai_compatible": OpenAICompatLLM,
+             "google_translate_web": GoogleWebLLM}
 
 
 def make_llm(cfg: dict, name: str | None = None):
